@@ -10,9 +10,13 @@ Remember about quotas:
     Usage: https://console.developers.google.com/apis/api/youtube/usage
 """
 import glob
+import json
+import logging
+import logging.config
 import os
 import re
 from collections import namedtuple
+from contextlib import wraps
 
 import pandas as pd
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -20,22 +24,69 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-CHANNEL_ID = "UCU4EZpLc84IZMFnpp1TyiKg"  # SiliconValleyVoice
-
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
-CLIENT_SECRETS_FILE = "client_secret_3.json"
+CLIENT_SECRETS_FILE = "client_secret_2.json"
 API_SERVICE_NAME = "youtube"
 API_VERSION = "v3"
 
+CHANNEL_ID = "UCU4EZpLc84IZMFnpp1TyiKg"  # SiliconValleyVoice
 
 Video = namedtuple("Video", "uploaded, video_id, title, sub_idx, sub_start, sub_end, sub_text")
 SubtitleMsg = namedtuple("SubtitleLine", "idx, start, end, text")
 
 
+def init_logger():
+    """Create logger"""
+    # create logger
+    logger = logging.getLogger("youtube_grabber")
+    logger.setLevel(logging.DEBUG)
+    # create console handler and set level to debug
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    # create formatter
+    formatter = logging.Formatter("%(asctime)s | %(name)s | %(levelname)-7s || %(message)s")
+    # add formatter to ch
+    ch.setFormatter(formatter)
+    # add ch to logger
+    logger.addHandler(ch)
+    return logger
+
+
+LOGGER = init_logger()
+
+
 def get_authenticated_service():
+    """Authenticate in google api"""
     flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
     credentials = flow.run_console()
     return build(API_SERVICE_NAME, API_VERSION, credentials=credentials)
+
+
+def catch_quota_err(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except HttpError as e:
+            # 403 Forbidden
+            if e.resp["status"] == "403":
+                err_content = json.loads(e.content)
+                reason = err_content["error"]["errors"][0]["reason"]
+                # quotaExceeded reason
+                if reason == "quotaExceeded":
+                    LOGGER.error(
+                        f"Error getting url: {e.uri}\n"
+                        f"Details: {err_content['error']['message']}\n\n"
+                    )
+                    raise e
+                # other reason with 403
+                else:
+                    LOGGER.error(f"Something happens:\n{e}")
+            # other than 403
+            else:
+                LOGGER.error(f"Something happens:\n{e}")
+
+    return wrapper
 
 
 class VideoGetter:
@@ -47,12 +98,12 @@ class VideoGetter:
     """
 
     DIR_NAME = "by_title"
-    GRAB_BEFORE = "2018-10-20T00:00:00Z"
-    GRAB_AFTER = "2018-01-01T00:00:00Z"
 
     def __init__(self, client, get_after_least: bool = True, get_latest: bool = False):
         self.client = client
         self.get_latest = get_latest
+        self.grab_before = None
+        self.grab_after = None
         self.get_after_least = get_after_least
         self.create_dir()
         self._get_search_videos()
@@ -69,8 +120,10 @@ class VideoGetter:
             dates.append(pd.to_datetime(date, format="%Y%m%d_%H%M%S", utc=True))
         if dates:
             return {"last": max(dates), "oldest": min(dates)}
-        return None  # TODO raise?
+        # TODO raise?
+        return None
 
+    @catch_quota_err
     def _get_search_videos(self, page_token: str = None):
         """
         https://developers.google.com/youtube/v3/docs/search/list
@@ -79,14 +132,14 @@ class VideoGetter:
         # get latest missing videos
         if self.get_latest:
             latest_video_date = self.get_extreme_video_date()["last"]
-            self.GRAB_AFTER = latest_video_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-            self.GRAB_BEFORE = None
+            self.grab_after = latest_video_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.grab_before = None
 
         # get old videos starting from existing
         if self.get_after_least:
             oldest_video_date = self.get_extreme_video_date()["oldest"]
-            self.GRAB_AFTER = None
-            self.GRAB_BEFORE = oldest_video_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.grab_after = None
+            self.grab_before = oldest_video_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         response = (
             self.client.search()
@@ -95,8 +148,8 @@ class VideoGetter:
                 channelId=CHANNEL_ID,
                 maxResults=50,
                 order="date",
-                publishedAfter=self.GRAB_AFTER,
-                publishedBefore=self.GRAB_BEFORE,
+                publishedAfter=self.grab_after,
+                publishedBefore=self.grab_before,
                 safeSearch=None,
                 type="video",
                 pageToken=page_token,
@@ -110,11 +163,11 @@ class VideoGetter:
             uploaded_time = pd.Timestamp(item["snippet"]["publishedAt"])
             video_id = item["id"]["videoId"]
             title = item["snippet"]["title"]
-            print(f"Processing video: {uploaded_time} - {title}")
+            LOGGER.info(f"Processing video: {uploaded_time} - {title}")
 
             asr_caption_id = self.get_asr_caption_id(item["id"]["videoId"])
             if not asr_caption_id:
-                print(f"\tvideo has no ASR caption")
+                LOGGER.info(f"video has no ASR caption")
                 continue
 
             subtitles = self.get_subtitles(asr_caption_id)
@@ -145,6 +198,7 @@ class VideoGetter:
         if next_page_token:
             self._get_search_videos(page_token=next_page_token)
 
+    @catch_quota_err
     def get_asr_caption_id(self, video_id: str = None):
         """
         https://developers.google.com/youtube/v3/docs/captions/list
@@ -157,6 +211,7 @@ class VideoGetter:
                 return item["id"]
         return None
 
+    @catch_quota_err
     def get_subtitles(self, caption_id: str):
         """
         https://developers.google.com/youtube/v3/docs/captions/download
